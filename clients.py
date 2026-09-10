@@ -1,41 +1,52 @@
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List
-from openai import (
-    AsyncOpenAI,
-    APIError as OpenAIAPIError,
-    RateLimitError as OpenAIRateLimitError,
-    APIConnectionError as OpenAIConnectionError,
-)
+from typing import Any, AsyncGenerator, List, Optional
+
 from anthropic import (
-    AsyncAnthropic,
-    APIError as AnthropicAPIError,
-    RateLimitError as AnthropicRateLimitError,
     APIConnectionError as AnthropicConnectionError,
+    APIError as AnthropicAPIError,
+    AsyncAnthropic,
+    RateLimitError as AnthropicRateLimitError,
 )
 from google import genai
 from google.genai import types
+try:
+    from google.genai.errors import APIError as GeminiAPIError
+    from google.genai.errors import ClientError as GeminiClientError
+except ImportError:  # google-genai muy antiguo
+    GeminiAPIError = Exception
+    GeminiClientError = Exception
+from openai import (
+    APIConnectionError as OpenAIConnectionError,
+    APIError as OpenAIAPIError,
+    AsyncOpenAI,
+    RateLimitError as OpenAIRateLimitError,
+)
 
-from schemas import Provider, ChatMessage, LLMConfig, ModelResponse
+from schemas import ChatMessage, LLMConfig, ModelResponse, Provider
+
+
+def _separar_system(messages: List[ChatMessage]) -> tuple[Optional[str], List[ChatMessage]]:
+    """Anthropic y Gemini no aceptan role=system dentro de messages."""
+    system_parts = [m.content for m in messages if m.role == "system"]
+    resto = [m for m in messages if m.role != "system"]
+    system = "\n\n".join(system_parts) if system_parts else None
+    return system, resto
 
 
 class BaseLLMClient(ABC):
-    """Contrato base que todo cliente de LLM debe cumplir, sin importar el proveedor."""
+    """Contrato común: cualquier proveedor implementa generate y generate_stream."""
 
     @abstractmethod
     async def generate(self, messages: List[ChatMessage]) -> ModelResponse:
-        """Genera una respuesta completa (modo normal, no streaming)."""
         raise NotImplementedError
 
     @abstractmethod
     async def generate_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
-        """Genera la respuesta token a token (modo streaming)."""
         raise NotImplementedError
-        yield  # Indica a Python que este método es un generador asíncrono
+        yield
 
 
 class OpenAIClient(BaseLLMClient):
-    """Cliente asíncrono para OpenAI."""
-
     def __init__(self, api_key: str, model: str, temperature: float, max_tokens: int):
         self._client = AsyncOpenAI(api_key=api_key)
         self.model = model
@@ -50,12 +61,15 @@ class OpenAIClient(BaseLLMClient):
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+            if not response.choices:
+                return ModelResponse(
+                    provider=Provider.OPENAI,
+                    model=self.model,
+                    content="",
+                    error="La API de OpenAI no devolvió choices",
+                )
             content = response.choices[0].message.content or ""
-            return ModelResponse(
-                provider=Provider.OPENAI,
-                model=self.model,
-                content=content,
-            )
+            return ModelResponse(provider=Provider.OPENAI, model=self.model, content=content)
         except OpenAIRateLimitError as e:
             return ModelResponse(
                 provider=Provider.OPENAI,
@@ -82,7 +96,7 @@ class OpenAIClient(BaseLLMClient):
                 provider=Provider.OPENAI,
                 model=self.model,
                 content="",
-                error=f"Error inesperado: {e}",
+                error=f"Error inesperado de OpenAI: {e}",
             )
 
     async def generate_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
@@ -95,38 +109,42 @@ class OpenAIClient(BaseLLMClient):
                 stream=True,
             )
             async for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta:
                     yield delta
         except (OpenAIRateLimitError, OpenAIConnectionError, OpenAIAPIError) as e:
-            yield f"\n[⚠️ Error durante el streaming de OpenAI: {e}]"
+            yield f"\n[Error durante el streaming de OpenAI: {e}]"
         except Exception as e:
-            yield f"\n[⚠️ Error inesperado en streaming de OpenAI: {e}]"
+            yield f"\n[Error inesperado durante el streaming de OpenAI: {e}]"
 
 
 class AnthropicClient(BaseLLMClient):
-    """Cliente asíncrono para Anthropic."""
-
     def __init__(self, api_key: str, model: str, temperature: float, max_tokens: int):
         self._client = AsyncAnthropic(api_key=api_key)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
 
+    def _kwargs_mensajes(self, messages: List[ChatMessage]) -> dict[str, Any]:
+        system, resto = _separar_system(messages)
+        # Anthropic acepta temperature en 0–1; el esquema unificado permite 0–2.
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": min(self.temperature, 1.0),
+            "messages": [m.model_dump() for m in resto],
+        }
+        if system:
+            payload["system"] = system
+        return payload
+
     async def generate(self, messages: List[ChatMessage]) -> ModelResponse:
         try:
-            response = await self._client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,  # Requerido en Anthropic
-                temperature=self.temperature,
-                messages=[m.model_dump() for m in messages],
-            )
+            response = await self._client.messages.create(**self._kwargs_mensajes(messages))
             content = response.content[0].text if response.content else ""
-            return ModelResponse(
-                provider=Provider.ANTHROPIC,
-                model=self.model,
-                content=content,
-            )
+            return ModelResponse(provider=Provider.ANTHROPIC, model=self.model, content=content)
         except AnthropicRateLimitError as e:
             return ModelResponse(
                 provider=Provider.ANTHROPIC,
@@ -153,28 +171,21 @@ class AnthropicClient(BaseLLMClient):
                 provider=Provider.ANTHROPIC,
                 model=self.model,
                 content="",
-                error=f"Error inesperado: {e}",
+                error=f"Error inesperado de Anthropic: {e}",
             )
 
     async def generate_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
         try:
-            async with self._client.messages.stream(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                messages=[m.model_dump() for m in messages],
-            ) as stream:
+            async with self._client.messages.stream(**self._kwargs_mensajes(messages)) as stream:
                 async for texto in stream.text_stream:
                     yield texto
         except (AnthropicRateLimitError, AnthropicConnectionError, AnthropicAPIError) as e:
-            yield f"\n[⚠️ Error durante el streaming de Anthropic: {e}]"
+            yield f"\n[Error durante el streaming de Anthropic: {e}]"
         except Exception as e:
-            yield f"\n[⚠️ Error inesperado en streaming de Anthropic: {e}]"
+            yield f"\n[Error inesperado durante el streaming de Anthropic: {e}]"
 
 
 class GeminiClient(BaseLLMClient):
-    """Cliente asíncrono para Google Gemini."""
-
     def __init__(self, api_key: str, model: str, temperature: float, max_tokens: int):
         self._client = genai.Client(api_key=api_key)
         self.model = model
@@ -182,16 +193,24 @@ class GeminiClient(BaseLLMClient):
         self.max_tokens = max_tokens
 
     def _convertir_mensajes(self, messages: List[ChatMessage]):
-        """Gemini separa el system prompt y utiliza 'model' para el rol del asistente."""
+        system, resto = _separar_system(messages)
         contents = []
-        system_instruction = None
-        for m in messages:
-            if m.role == "system":
-                system_instruction = m.content
-            else:
-                rol_gemini = "model" if m.role == "assistant" else "user"
-                contents.append(types.Content(role=rol_gemini, parts=[types.Part.from_text(text=m.content)]))
-        return contents, system_instruction
+        for m in resto:
+            rol = "model" if m.role == "assistant" else "user"
+            contents.append(types.Content(role=rol, parts=[types.Part.from_text(text=m.content)]))
+        return contents, system
+
+    def _error_gemini(self, exc: Exception) -> str:
+        if isinstance(exc, GeminiClientError) and getattr(exc, "code", None) == 429:
+            return f"Límite de cuota excedido: {exc}"
+        if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
+            return f"Error de conexión: {exc}"
+        if isinstance(exc, GeminiAPIError):
+            return f"Error de la API de Gemini: {exc}"
+        nombre = type(exc).__name__.lower()
+        if "connect" in nombre or "timeout" in nombre:
+            return f"Error de conexión: {exc}"
+        return f"Error de la API de Gemini: {exc}"
 
     async def generate(self, messages: List[ChatMessage]) -> ModelResponse:
         try:
@@ -215,7 +234,7 @@ class GeminiClient(BaseLLMClient):
                 provider=Provider.GEMINI,
                 model=self.model,
                 content="",
-                error=f"Error de la API de Gemini: {e}",
+                error=self._error_gemini(e),
             )
 
     async def generate_stream(self, messages: List[ChatMessage]) -> AsyncGenerator[str, None]:
@@ -234,18 +253,20 @@ class GeminiClient(BaseLLMClient):
                 if chunk.text:
                     yield chunk.text
         except Exception as e:
-            yield f"\n[⚠️ Error durante el streaming de Gemini: {e}]"
+            yield f"\n[Error durante el streaming de Gemini: {self._error_gemini(e)}]"
 
 
 class AsyncLLMManager:
-    """
-    Factory Pattern: orquesta la instanciación del cliente correspondiente
-    según la configuración sin acoplar la lógica de negocio.
-    """
+    """Factory: instancia OpenAI, Anthropic o Gemini según LLMConfig.provider."""
 
     def __init__(self, config: LLMConfig):
         self.config = config
         self._client: BaseLLMClient = self._crear_cliente()
+
+    @classmethod
+    def from_env(cls) -> "AsyncLLMManager":
+        """Carga el proveedor indicado por LLM_PROVIDER sin tocar código de negocio."""
+        return cls(LLMConfig.from_env())
 
     def _crear_cliente(self) -> BaseLLMClient:
         if self.config.provider == Provider.OPENAI:
