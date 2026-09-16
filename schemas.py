@@ -78,3 +78,41 @@ class ModelResponse(BaseModel):
     model: str
     content: str
     error: Optional[str] = None
+
+
+class NivelDeCriticidad(str, Enum):
+    BAJA = "baja"
+    MEDIA = "media"
+    ALTA = "alta"
+
+
+class EntidadesTecnicas(BaseModel):
+    """Contrato de salida del pipeline de extracción técnica."""
+
+    tecnologias: list[str] = Field(
+        min_length=1,
+        description="Tecnologías, frameworks, lenguajes o infra mencionadas en el texto.",
+    )
+    nivel_de_criticidad: NivelDeCriticidad = Field(
+        description="Impacto operativo del hallazgo: baja, media o alta.",
+    )
+    resumen_tecnico: str = Field(
+        min_length=10,
+        description="Resumen breve del problema o arquitectura, en una o dos oraciones.",
+    )
+
+    @field_validator("tecnologias")
+    @classmethod
+    def tecnologias_no_vacias(cls, v: list[str]) -> list[str]:
+        limpias = [item.strip() for item in v if item and item.strip()]
+        if not limpias:
+            raise ValueError("tecnologias no puede estar vacía ni contener solo espacios")
+        return limpias
+
+    @field_validator("resumen_tecnico")
+    @classmethod
+    def resumen_sin_espacios_vacios(cls, v: str) -> str:
+        resumen = v.strip()
+        if len(resumen) < 10:
+            raise ValueError("resumen_tecnico debe tener al menos 10 caracteres")
+        return resumen

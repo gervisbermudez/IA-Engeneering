@@ -1,36 +1,59 @@
-# Unified Async LLM Client — Pre-entrega 1
+# Pipeline de extracción de entidades técnicas — Pre-entrega 2
 
-Cliente asíncrono unificado para **OpenAI**, **Anthropic** y **Gemini** (Python 3.12).
+Pipeline LCEL que recibe un párrafo sin procesar (arquitectura o log de error) y
+devuelve un objeto Pydantic validado.
 
-## Arquitectura
+Este repo también incluye el cliente asíncrono unificado del Módulo 1
+(`clients.py` + `main.py`).
 
-El código de negocio (`main.py`) nunca instancia un SDK. Habla solo con `AsyncLLMManager`.
+## Contrato de salida
 
-```text
-BaseLLMClient (ABC)
-  generate() / generate_stream()
-        ▲
-        │  mismo contrato
-        │
-  OpenAIClient    AnthropicClient    GeminiClient
-  (AsyncOpenAI)   (AsyncAnthropic)   (genai.aio)
-        ▲
-        │
-  AsyncLLMManager  ← factory
-        │
-  LLMConfig.provider  ← variable LLM_PROVIDER en .env
+```json
+{
+  "tecnologias": ["FastAPI", "Redis", "PostgreSQL"],
+  "nivel_de_criticidad": "alta",
+  "resumen_tecnico": "API con caché en Redis y persistencia en PostgreSQL; cuello de botella en conexiones concurrentes."
+}
 ```
 
-- **Intercambiabilidad:** cambiar `LLM_PROVIDER` (openai | anthropic | gemini) cambia el cliente sin tocar `main.py`.
-- **Asincronía:** todas las llamadas de red usan `await` (`AsyncOpenAI`, `AsyncAnthropic`, `client.aio`).
-- **Streaming:** `generate_stream` es un generador asíncrono (`yield` dentro de `async for`).
-- **Validación:** Pydantic valida `ChatMessage`, `LLMConfig` (temperatura 0–2, `max_tokens > 0`) y `ModelResponse`. Las claves van en `SecretStr`.
-- **Resiliencia:** `RateLimitError` y `APIConnectionError` se empaquetan en `ModelResponse.error`; no tumban el proceso.
+El modelo `EntidadesTecnicas` exige:
+
+- `tecnologias`: lista no vacía (sin strings en blanco)
+- `nivel_de_criticidad`: enum `baja` | `media` | `alta`
+- `resumen_tecnico`: al menos 10 caracteres
+
+## Arquitectura del pipeline
+
+```text
+ChatPromptTemplate
+        │
+        ▼
+ChatOpenAI / ChatAnthropic / Gemini   ← LLMConfig.from_env() (Módulo 1)
+        │
+        ▼
+.with_structured_output(EntidadesTecnicas, include_raw=True)
+        │
+        ▼
+validación (finish_reason + parseo)
+        │
+        ▼
+.with_retry()  →  process_text() / ainvoke()
+```
+
+- **Prompt modular:** `ChatPromptTemplate` con la variable `{text}`. No hay f-strings
+  dentro de la cadena.
+- **Salida estructurada:** `model.with_structured_output(EntidadesTecnicas)`.
+- **Resiliencia:** `.with_retry()` (hasta 3 intentos) ante JSON mal formado, objeto
+  incompleto, `finish_reason` de corte por tokens (`length` / `max_tokens`) si el
+  parseo falló, y errores transitorios de API (5xx, 429, timeout). Si el JSON ya
+  valida, no se descarta por un `finish_reason` de corte. El pipeline pide al menos
+  2048 tokens de salida.
+- **Asincronía:** `process_text(text)` usa `.ainvoke()`.
 
 ## Requisitos
 
 - Python 3.12
-- Al menos la API key del proveedor indicado en `LLM_PROVIDER`
+- API key del proveedor indicado en `LLM_PROVIDER` (`openai`, `anthropic` o `gemini`)
 
 ## Cómo correrlo
 
@@ -50,26 +73,31 @@ ANTHROPIC_API_KEY=tu_clave_de_anthropic
 GOOGLE_API_KEY=tu_clave_de_gemini
 ```
 
-`AsyncLLMManager.from_env()` lee `LLM_PROVIDER` y la clave asociada. Para probar Anthropic, cambiá a `LLM_PROVIDER=anthropic` (y así con `gemini`).
+```bash
+python run_pipeline.py
+```
+
+El script:
+
+1. Muestra que Pydantic rechaza `tecnologias` vacías **antes** de llamar al LLM
+2. Extrae entidades de una descripción de arquitectura + incidente
+3. Hace una prueba de estrés con un texto ambiguo
+
+Para el demo del Módulo 1 (cliente unificado + streaming):
 
 ```bash
 python main.py
 ```
 
-El script prueba:
-
-1. Validación Pydantic (`temperature` fuera de 0–2)
-2. Resiliencia con una API key inválida (no crashea)
-3. Modo normal y streaming con *"¿Qué es la entropía?"* sobre el proveedor configurado
-
 ## Archivos
 
 ```text
-schemas.py        ChatMessage, LLMConfig, ModelResponse, Provider
-clients.py        BaseLLMClient, OpenAI / Anthropic / Gemini, AsyncLLMManager
-main.py           script de prueba
-requirements.txt  openai, anthropic, google-genai, pydantic, python-dotenv
-.env.example      plantilla de variables (no subas .env)
-.gitignore        excluye .env, .venv, __pycache__
-README.md         este archivo
+schemas.py        Contratos Pydantic (Módulo 1 + EntidadesTecnicas)
+chain.py          Prompt, LCEL, retry y process_text()
+run_pipeline.py   Mini-script asíncrono de prueba
+clients.py        Factory OpenAI / Anthropic / Gemini (Módulo 1)
+main.py           Demo del cliente unificado
+requirements.txt
+.env.example
+README.md
 ```
