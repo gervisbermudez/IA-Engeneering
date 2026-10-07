@@ -18,6 +18,9 @@ build/
 dist/
 *.egg-info/
 
+# Índice vectorial local
+vectorstore/
+
 # IDEs
 .vscode/
 .idea/

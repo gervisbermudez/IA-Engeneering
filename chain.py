@@ -101,6 +101,11 @@ def _crear_modelo(config: LLMConfig | None = None) -> BaseChatModel:
     raise ValueError(f"Proveedor no soportado: {cfg.provider}")
 
 
+def crear_modelo(config: LLMConfig | None = None) -> BaseChatModel:
+    """Punto público para instanciar el chat model. Lo usa el RAG."""
+    return _crear_modelo(config)
+
+
 def _finish_reason(raw: AIMessage | None) -> str | None:
     if raw is None:
         return None
